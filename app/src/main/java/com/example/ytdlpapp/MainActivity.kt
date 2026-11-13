@@ -1,22 +1,18 @@
 package com.example.ytdlpapp
 
+import android.Manifest
 import android.content.ActivityNotFoundException
-import android.content.ContentValues
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
-import android.provider.Settings
-import androidx.appcompat.app.AlertDialog
-import androidx.core.content.FileProvider
-import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
-import android.view.View
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.Environment
-import android.provider.MediaStore
-import android.webkit.MimeTypeMap
+import android.provider.Settings
+import android.view.Menu
+import android.view.MenuItem
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ProgressBar
@@ -24,20 +20,27 @@ import android.widget.RadioButton
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.yausername.ffmpeg.FFmpeg
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDL.UpdateChannel
-import com.yausername.youtubedl_android.YoutubeDLRequest
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), DownloadState.Listener {
 
     private lateinit var etUrl: EditText
     private lateinit var rbAudio: RadioButton
     private lateinit var btnDownload: Button
     private lateinit var btnUpdate: Button
+    private lateinit var btnCancel: Button
     private lateinit var btnOpen: Button
     private lateinit var btnCheckUpdate: Button
     private lateinit var progressBar: ProgressBar
@@ -46,11 +49,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scrollLog: ScrollView
 
     @Volatile private var ready = false
-    @Volatile private var busy = false
-    @Volatile private var appUpdating = false
+    @Volatile private var busy = false          // update yt-dlp sedang berjalan
+    @Volatile private var appUpdating = false   // cek/unduh update aplikasi sedang berjalan
+
     private val releaseApi = "https://api.github.com/repos/ReiyaGT/quick-downloader/releases/latest"
-    private var lastUri: Uri? = null
-    private var lastMime: String = "*/*"
 
     private val logBuf = StringBuilder()
     private val uiHandler = Handler(Looper.getMainLooper())
@@ -58,6 +60,14 @@ class MainActivity : AppCompatActivity() {
     private var loadingDots = 0
     private val loadingText = "Menyiapkan ytdlp+ ffmpeg"
     private val maxDots = 5
+
+    private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
+
+    private val notifPermLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+            // Setelah notifikasi (diizinkan atau tidak), lanjut ke izin baterai
+            askBatteryUnrestricted()
+        }
 
     private val loadingTick = object : Runnable {
         override fun run() {
@@ -76,6 +86,7 @@ class MainActivity : AppCompatActivity() {
         rbAudio = findViewById(R.id.rbAudio)
         btnDownload = findViewById(R.id.btnDownload)
         btnUpdate = findViewById(R.id.btnUpdate)
+        btnCancel = findViewById(R.id.btnCancel)
         btnOpen = findViewById(R.id.btnOpen)
         btnCheckUpdate = findViewById(R.id.btnCheckUpdate)
         progressBar = findViewById(R.id.progressBar)
@@ -85,13 +96,11 @@ class MainActivity : AppCompatActivity() {
 
         btnDownload.setOnClickListener { startDownload() }
         btnUpdate.setOnClickListener { startUpdate() }
+        btnCancel.setOnClickListener { cancelDownload() }
         btnOpen.setOnClickListener { openLastFile() }
         btnCheckUpdate.setOnClickListener { checkAppUpdate() }
 
-        // Link yang di-share dari app lain (YouTube, dll) ke app ini
-        if (intent?.action == android.content.Intent.ACTION_SEND) {
-            intent.getStringExtra(android.content.Intent.EXTRA_TEXT)?.let { etUrl.setText(it) }
-        }
+        handleShareIntent(intent)
 
         log("Quick Downloader by Resi Surya")
         log("Aplikasi ini merupakan Fork dari yt-dlp. Pengembangan dilakukan hanya untuk educational only")
@@ -99,7 +108,83 @@ class MainActivity : AppCompatActivity() {
         log("Tekan tombol Update YT-DLP untuk pembaruan sistem")
 
         initLibrary()
+        maybeShowFirstRunPermissions()
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShareIntent(intent)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        DownloadState.attach(this)
+    }
+
+    override fun onStop() {
+        DownloadState.detach(this)
+        super.onStop()
+    }
+
+    // ---------- Menu (ikon gerigi) ----------
+
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menuInflater.inflate(R.menu.main_menu, menu)
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        if (item.itemId == R.id.action_settings) {
+            startActivity(Intent(this, SettingsActivity::class.java))
+            return true
+        }
+        return super.onOptionsItemSelected(item)
+    }
+
+    private fun handleShareIntent(i: Intent?) {
+        // Link yang di-share dari app lain (YouTube, dll) ke app ini
+        if (i?.action == Intent.ACTION_SEND) {
+            i.getStringExtra(Intent.EXTRA_TEXT)?.let { etUrl.setText(it) }
+        }
+    }
+
+    // ---------- Izin pertama kali ----------
+
+    private fun maybeShowFirstRunPermissions() {
+        if (prefs.getBoolean("perm_prompted", false)) return
+        // Ditandai sekarang juga, supaya tidak diminta berulang-ulang
+        prefs.edit().putBoolean("perm_prompted", true).apply()
+
+        AlertDialog.Builder(this)
+            .setTitle("Izin yang dibutuhkan")
+            .setMessage(
+                "Supaya unduhan tetap berjalan di latar belakang dan progresnya terlihat, " +
+                    "izinkan:\n\n• Notifikasi\n• Penggunaan baterai tanpa batas\n\n" +
+                    "Kamu bisa mengubahnya kapan saja lewat ikon pengaturan (gerigi)."
+            )
+            .setCancelable(false)
+            .setPositiveButton("Lanjut") { _, _ -> askNotificationThenBattery() }
+            .setNegativeButton("Nanti", null)
+            .show()
+    }
+
+    private fun askNotificationThenBattery() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            askBatteryUnrestricted()
+        }
+    }
+
+    private fun askBatteryUnrestricted() {
+        if (!Perms.batteryUnrestricted(this)) Perms.requestBattery(this)
+    }
+
+    // ---------- Init library ----------
 
     private fun initLibrary() {
         loadingActive = true
@@ -113,7 +198,7 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { finishLoading(".".repeat(maxDots)) }
                 log("Selesai dimuat")
                 log("Aplikasi siap digunakan")
-                setButtons(true)
+                refreshButtons()
             } catch (e: Exception) {
                 runOnUiThread { finishLoading(".".repeat(loadingDots)) }
                 log("Gagal init: ${e.message}")
@@ -133,20 +218,38 @@ class MainActivity : AppCompatActivity() {
         scrollLog.post { scrollLog.fullScroll(ScrollView.FOCUS_DOWN) }
     }
 
-    private fun setButtons(enabled: Boolean) = runOnUiThread {
-        btnDownload.isEnabled = enabled
-        btnUpdate.isEnabled = enabled
-    }
-
     private fun log(msg: String) = runOnUiThread {
         logBuf.append(msg).append("\n")
         renderLog(if (loadingActive) loadingText + ".".repeat(loadingDots) else null)
     }
 
+    // ---------- DownloadState.Listener ----------
+
+    override fun onLog(msg: String) = log(msg)
+
+    override fun onStateChanged() {
+        val s = DownloadState
+        progressBar.progress = s.progress
+        tvStatus.text = s.line
+        btnCancel.visibility = if (s.status == DownloadState.Status.RUNNING) View.VISIBLE else View.GONE
+        btnOpen.visibility =
+            if (s.status == DownloadState.Status.DONE && s.lastUri != null) View.VISIBLE else View.GONE
+        refreshButtons()
+    }
+
+    private fun refreshButtons() = runOnUiThread {
+        val running = DownloadState.status == DownloadState.Status.RUNNING
+        val enabled = ready && !busy && !running
+        btnDownload.isEnabled = enabled
+        btnUpdate.isEnabled = enabled
+    }
+
+    // ---------- Update yt-dlp ----------
+
     private fun startUpdate() {
         if (!ready || busy) return
         busy = true
-        setButtons(false)
+        refreshButtons()
         log("Update yt-dlp...")
         Thread {
             try {
@@ -156,10 +259,12 @@ class MainActivity : AppCompatActivity() {
                 log("Update gagal: ${e.message}")
             } finally {
                 busy = false
-                setButtons(true)
+                refreshButtons()
             }
         }.start()
     }
+
+    // ---------- Unduh / batal ----------
 
     private fun startDownload() {
         val url = etUrl.text.toString().trim()
@@ -167,80 +272,27 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Isi link dulu", Toast.LENGTH_SHORT).show()
             return
         }
-        if (!ready || busy) return
+        if (!ready || busy || DownloadState.status == DownloadState.Status.RUNNING) return
 
-        busy = true
-        setButtons(false)
-        progressBar.progress = 0
-        btnOpen.visibility = View.GONE
-        lastUri = null
-        val audioOnly = rbAudio.isChecked
-        log("Mulai: $url")
-
-        Thread {
-            val tmp = File(cacheDir, "dl").apply { deleteRecursively(); mkdirs() }
-            try {
-                val request = YoutubeDLRequest(url)
-                request.addOption("--no-playlist")
-                request.addOption("--no-mtime")
-                request.addOption("-o", "${tmp.absolutePath}/%(title).100s.%(ext)s")
-                if (audioOnly) {
-                    request.addOption("-x")
-                    request.addOption("--audio-format", "mp3")
-                } else {
-                    request.addOption("-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b")
-                    request.addOption("--merge-output-format", "mp4")
-                }
-
-                YoutubeDL.getInstance().execute(request, null) { progress, _, line ->
-                    runOnUiThread {
-                        progressBar.progress = progress.toInt().coerceIn(0, 100)
-                        tvStatus.text = line
-                    }
-                }
-
-                val files = tmp.listFiles()
-                    ?.filter { it.isFile && it.extension !in listOf("part", "ytdl", "temp") }
-                    .orEmpty()
-                if (files.isEmpty()) log("Tidak ada file hasil.")
-                files.forEach {
-                    val sub = if (audioOnly) "Audio" else "Video"
-                    val (uri, mime) = saveToDownloads(it, sub)
-                    lastUri = uri
-                    lastMime = mime
-                    log("Tersimpan: Download/QuickDownloader/$sub/${it.name}")
-                }
-                if (lastUri != null) runOnUiThread { btnOpen.visibility = View.VISIBLE }
-            } catch (e: Exception) {
-                log("Error: ${e.message}")
-            } finally {
-                tmp.deleteRecursively()
-                busy = false
-                setButtons(true)
-            }
-        }.start()
+        DownloadState.begin()
+        try {
+            DownloadService.start(this, url, rbAudio.isChecked)
+        } catch (e: Exception) {
+            DownloadState.finish(DownloadState.Status.ERROR)
+            log("Gagal memulai unduhan: ${e.message}")
+        }
     }
 
-    private fun saveToDownloads(file: File, subFolder: String): Pair<Uri, String> {
-        val mime = MimeTypeMap.getSingleton()
-            .getMimeTypeFromExtension(file.extension.lowercase()) ?: "application/octet-stream"
-        val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, file.name)
-            put(MediaStore.Downloads.MIME_TYPE, mime)
-            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/QuickDownloader/$subFolder")
-        }
-        val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: throw IOException("Gagal membuat file di Downloads")
-        contentResolver.openOutputStream(uri)?.use { out ->
-            file.inputStream().use { it.copyTo(out) }
-        } ?: throw IOException("Gagal menulis file")
-        return uri to mime
+    private fun cancelDownload() {
+        if (DownloadState.status != DownloadState.Status.RUNNING) return
+        Toast.makeText(this, "Membatalkan unduhan...", Toast.LENGTH_SHORT).show()
+        DownloadService.cancel(this)
     }
 
     private fun openLastFile() {
-        val uri = lastUri ?: return
+        val uri = DownloadState.lastUri ?: return
         val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, lastMime)
+            setDataAndType(uri, DownloadState.lastMime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         try {
@@ -250,10 +302,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---------- Update aplikasi (via GitHub Releases) ----------
+    // ---------- Update aplikasi (via GitHub Releases, SemVer) ----------
+
+    /** "v1.2.3" -> 10203. versionCode aplikasi memakai rumus yang sama. */
+    private fun semverToCode(tag: String): Long? {
+        val m = Regex("""^v?(\d+)\.(\d+)\.(\d+)""").find(tag.trim()) ?: return null
+        val (major, minor, patch) = m.destructured
+        return major.toLong() * 10000 + minor.toLong() * 100 + patch.toLong()
+    }
 
     private fun checkAppUpdate() {
         if (appUpdating) return
+        if (DownloadState.status == DownloadState.Status.RUNNING) {
+            Toast.makeText(this, "Tunggu unduhan selesai dulu", Toast.LENGTH_SHORT).show()
+            return
+        }
         appUpdating = true
         btnCheckUpdate.isEnabled = false
         log("Mengecek update aplikasi...")
@@ -273,12 +336,14 @@ class MainActivity : AppCompatActivity() {
 
                 val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
                 val tag = json.getString("tag_name")
-                val remote = Regex("\\d+").findAll(tag).lastOrNull()?.value?.toLongOrNull()
-                    ?: throw IOException("Format tag tidak dikenali: $tag")
-                val local = packageManager.getPackageInfo(packageName, 0).longVersionCode
+                val remote = semverToCode(tag)
+                    ?: throw IOException("Format tag tidak dikenali: $tag (harus seperti v1.2.3)")
+                val info = packageManager.getPackageInfo(packageName, 0)
+                val local = info.longVersionCode
+                val localName = info.versionName ?: "?"
 
                 if (remote <= local) {
-                    log("Sudah versi terbaru (build $local).")
+                    log("Sudah versi terbaru (v$localName).")
                     return@Thread
                 }
 
@@ -295,8 +360,8 @@ class MainActivity : AppCompatActivity() {
                     log("Rilis $tag tidak memiliki file APK.")
                     return@Thread
                 }
-                log("Versi baru tersedia: build $remote (terpasang: build $local)")
-                runOnUiThread { showUpdateDialog(remote, apkUrl) }
+                log("Versi baru tersedia: $tag (terpasang: v$localName)")
+                runOnUiThread { showUpdateDialog(tag, localName, apkUrl) }
             } catch (e: Exception) {
                 log("Cek update gagal: ${e.message}")
             } finally {
@@ -306,10 +371,10 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun showUpdateDialog(version: Long, apkUrl: String) {
+    private fun showUpdateDialog(tag: String, localName: String, apkUrl: String) {
         AlertDialog.Builder(this)
             .setTitle("Update tersedia")
-            .setMessage("Versi baru (build $version) tersedia. Unduh dan pasang sekarang?")
+            .setMessage("Versi baru $tag tersedia (terpasang: v$localName). Unduh dan pasang sekarang?")
             .setPositiveButton("Update") { _, _ -> downloadAndInstall(apkUrl) }
             .setNegativeButton("Nanti", null)
             .show()

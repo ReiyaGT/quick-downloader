@@ -5,6 +5,14 @@ plugins {
 
 val youtubedlAndroid = "0.18.1" // kalau gagal resolve, coba "0.17.4"
 
+// Versi mengikuti Semantic Versioning (MAJOR.MINOR.PATCH).
+// Di CI, APP_VERSION diisi dari tag git (v1.2.3 -> 1.2.3). Lokal/non-tag: 1.0.0-dev.
+val appVersionName: String = System.getenv("APP_VERSION")?.takeIf { it.isNotBlank() } ?: "1.0.0-dev"
+val semverParts: List<Int> = Regex("^(\\d+)\\.(\\d+)\\.(\\d+)").find(appVersionName)
+    ?.groupValues?.drop(1)?.map { it.toInt() } ?: listOf(1, 0, 0)
+// versionCode = MAJOR*10000 + MINOR*100 + PATCH  (1.2.3 -> 10203)
+val appVersionCode: Int = semverParts[0] * 10000 + semverParts[1] * 100 + semverParts[2]
+
 android {
     namespace = "com.example.ytdlpapp"
     compileSdk = 34
@@ -13,9 +21,8 @@ android {
         applicationId = "com.example.ytdlpapp"
         minSdk = 29
         targetSdk = 34
-        // Di GitHub Actions otomatis naik setiap build; lokal tetap 1
-        versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
-        versionName = "1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
     }
 
     // Hanya arm64-v8a (Android ARM 64-bit)
